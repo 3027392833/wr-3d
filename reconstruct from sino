@@ -1,0 +1,138 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import astra
+import os
+import pydicom
+from tqdm import tqdm
+
+class CBCTReconstructor:
+    def __init__(self, sinogram, metadata, detector_width, detector_height,
+                 source_origin, origin_detector, angle_range=(0, 360), angle_step=1.0):
+        """
+        初始化 CBCT 重建器
+
+        参数:
+        - sinogram: 输入的投影数据（正弦图），形状为 (angles, height, width)
+        - metadata: DICOM 元数据
+        - detector_width: 探测器宽度（像素数）
+        - detector_height: 探测器高度（像素数）
+        - source_origin: 光源到旋转中心的距离（毫米）
+        - origin_detector: 旋转中心到探测器的距离（毫米）
+        - angle_range: 角度范围（起始角度, 结束角度），默认为 (0, 360)
+        - angle_step: 角度步长（度），控制投影角度的密度
+        """
+        self.sinogram = sinogram
+        self.metadata = metadata
+        self.detector_width = detector_width
+        self.detector_height = detector_height
+        self.source_origin = source_origin
+        self.origin_detector = origin_detector
+        self.angle_range = angle_range
+        self.angle_step = angle_step
+
+        # 检查数据维度
+        if self.sinogram.ndim != 3:
+            raise ValueError("Sinogram must be 3D (angles, height, width).")
+
+    def reconstruct(self, output_dicom_dir):
+        """
+        从投影数据重建图像
+
+        参数:
+        - output_dicom_dir: 输出的 DICOM 文件目录
+
+        返回:
+        - reconstruction: 重建后的 3D 图像数据
+        """
+        # 计算投影角度
+        start_angle, end_angle = self.angle_range
+        angles = np.arange(start_angle, end_angle, self.angle_step)  # 根据 angle_range 和 angle_step 生成角度
+        angles_rad = np.deg2rad(angles)  # 转换为弧度
+
+        # 创建 CBCT 投影几何（锥形束）
+        proj_geom = astra.create_proj_geom('cone',  # 锥形束几何
+                                           1.0, 1.0,  # 探测器像素尺寸
+                                           self.detector_height, self.detector_width,  # 探测器尺寸
+                                           angles_rad,  # 投影角度
+                                           self.source_origin, self.origin_detector)  # 几何参数
+
+        # 创建体几何
+        # 假设重建图像的尺寸与投影数据的尺寸一致
+        vol_geom = astra.create_vol_geom(self.detector_height, self.detector_width, self.detector_height)
+
+        # 创建投影数据对象
+        proj_id = astra.data3d.create('-sino', proj_geom, self.sinogram)
+
+        # 创建体数据对象
+        vol_id = astra.data3d.create('-vol', vol_geom)
+
+        # 配置滤波反投影（FDK）算法
+        fbp_cfg = astra.astra_dict('FDK_CUDA')
+        fbp_cfg['ProjectionDataId'] = proj_id
+        fbp_cfg['ReconstructionDataId'] = vol_id
+
+        # 创建并运行 FBP 算法
+        fbp_id = astra.algorithm.create(fbp_cfg)
+        astra.algorithm.run(fbp_id)
+
+        # 获取重建图像
+        reconstruction = astra.data3d.get(vol_id)
+
+        # 将重建结果保存为 DICOM 文件
+        self.save_dicom(reconstruction, output_dicom_dir)
+        print(f"Reconstructed DICOM files saved to {output_dicom_dir}")
+
+        # 清理 ASTRA 对象
+        astra.algorithm.delete(fbp_id)
+        astra.data3d.delete(proj_id)
+        astra.data3d.delete(vol_id)
+
+        # 返回重建结果
+        return reconstruction
+
+    def save_dicom(self, data, output_dir):
+        """
+        将重建结果保存为 DICOM 文件
+
+        参数:
+        - data: 重建后的 3D 图像数据
+        - output_dir: 输出的 DICOM 文件目录
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        for i in range(data.shape[0]):
+            ds = pydicom.Dataset()  # 创建新的 DICOM 文件
+            ds.PixelData = data[i].tobytes()  # 设置像素数据
+            ds.Rows, ds.Columns = data[i].shape
+            ds.BitsAllocated = 16
+            ds.BitsStored = 16
+            ds.HighBit = 15
+            ds.PixelRepresentation = 1  # 有符号整数
+            ds.PhotometricInterpretation = 'MONOCHROME2'
+            ds.SamplesPerPixel = 1
+            ds.PixelSpacing = [self.metadata['pixel_spacing'], self.metadata['pixel_spacing']]
+            ds.SliceThickness = self.metadata['slice_thickness']
+            ds.save_as(os.path.join(output_dir, f'recon_{i:04d}.dcm'))
+
+    def visualize(self, reconstruction):
+        """
+        可视化正弦图和重建图像
+
+        参数:
+        - reconstruction: 重建后的 3D 图像数据
+        """
+        slice_idx = reconstruction.shape[0] // 2  # 中间切片
+
+        plt.figure(figsize=(12, 6))
+
+        # 显示正弦图（以第一个角度为例）
+        plt.subplot(1, 2, 1)
+        plt.imshow(self.sinogram[slice_idx, :, :], cmap='gray')
+        plt.title('Sinogram (First Angle)')
+
+        # 显示重建图像
+        plt.subplot(1, 2, 2)
+        plt.imshow(reconstruction[slice_idx, :, :], cmap='gray')
+        plt.title('Reconstructed Slice (FBP)')
+
+        plt.tight_layout()
+        plt.show()
